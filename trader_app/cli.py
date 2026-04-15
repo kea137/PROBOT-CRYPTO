@@ -152,6 +152,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SETTINGS.loss_cooldown,
         help="Seconds to pause new entries after a losing trade (0 = disabled).",
     )
+    parser.add_argument(
+        "--confluence-threshold",
+        type=int,
+        default=DEFAULT_SETTINGS.confluence_threshold,
+        help="Minimum number of confirming indicators required to enter a trade (0 = disabled, 2-3 recommended).",
+    )
+    parser.add_argument(
+        "--volume-confirmation",
+        action="store_true",
+        help="Require current volume to be at or above the 20-period average before entering a trade.",
+    )
+    parser.add_argument(
+        "--max-daily-loss",
+        type=float,
+        default=DEFAULT_SETTINGS.max_daily_loss,
+        help="Maximum fraction of starting equity that can be lost in a single calendar day (0 = disabled, 0.03 recommended).",
+    )
+    parser.add_argument(
+        "--max-drawdown",
+        type=float,
+        default=DEFAULT_SETTINGS.max_drawdown,
+        help="Maximum drawdown fraction from peak equity before the bot stops trading (0 = disabled, 0.05 recommended).",
+    )
 
     return parser
 
@@ -191,6 +214,10 @@ def parse_settings() -> Settings:
         min_adx=args.min_adx,
         rsi_filter=args.rsi_filter,
         loss_cooldown=args.loss_cooldown,
+        confluence_threshold=args.confluence_threshold,
+        volume_confirmation=args.volume_confirmation,
+        max_daily_loss=args.max_daily_loss,
+        max_drawdown=args.max_drawdown,
     )
 
 

@@ -62,6 +62,7 @@ class BotState:
     entry_cost: float | None = None
     last_total_equity: float | None = None
     last_candle_time: float | None = None
+    peak_equity: float | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,9 @@ class MarketSnapshot:
     spread: float | None = None
     long_ma_slope: float | None = None
     latest_bar_time: float | None = None
+    macd_histogram: float | None = None
+    confluence_score: int | None = None
+    volume_confirmed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,7 @@ def load_state(state_file: str) -> BotState:
         entry_cost=data.get("entry_cost"),
         last_total_equity=data.get("last_total_equity"),
         last_candle_time=data.get("last_candle_time"),
+        peak_equity=data.get("peak_equity"),
     )
 
 
@@ -539,9 +544,20 @@ def format_decision_summary(snapshot: MarketSnapshot, use_xgboost: bool) -> str:
     )
 
 
-def should_enter_position(snapshot: MarketSnapshot, allow_short: bool, use_xgboost: bool) -> tuple[bool, str]:
+def should_enter_position(snapshot: MarketSnapshot, allow_short: bool, use_xgboost: bool, settings: Settings | None = None) -> tuple[bool, str]:
     ml_bias = _effective_ml_bias(snapshot)
     momentum = getattr(snapshot, "momentum", None)
+
+    # Volume confirmation gate
+    if settings is not None and settings.volume_confirmation:
+        if snapshot.volume_confirmed is not None and not snapshot.volume_confirmed:
+            return False, "low_volume"
+
+    # Confluence gate
+    if settings is not None and settings.confluence_threshold > 0:
+        score = snapshot.confluence_score if snapshot.confluence_score is not None else 0
+        if score < settings.confluence_threshold:
+            return False, f"low_confluence_{score}"
 
     if snapshot.signal == "BUY":
         if snapshot.order_book_bias == "SELL" and not _can_override_order_book_conflict(snapshot, "BUY"):
@@ -552,6 +568,9 @@ def should_enter_position(snapshot: MarketSnapshot, allow_short: bool, use_xgboo
             return False, "price_too_high"
         if use_xgboost and ml_bias is not None and ml_bias != "BUY" and not _should_ignore_ml_conflict(snapshot):
             return False, "ml_conflict"
+        # MACD confirmation — reject BUY when histogram is strongly bearish
+        if snapshot.macd_histogram is not None and snapshot.macd_histogram < 0 and snapshot.order_book_bias != "BUY":
+            return False, "macd_bearish"
         return True, "signal_and_order_book"
 
     if snapshot.signal == "SELL":
@@ -565,6 +584,9 @@ def should_enter_position(snapshot: MarketSnapshot, allow_short: bool, use_xgboo
             return False, "price_too_low"
         if use_xgboost and ml_bias is not None and ml_bias != "SELL" and not _should_ignore_ml_conflict(snapshot):
             return False, "ml_conflict"
+        # MACD confirmation — reject SELL when histogram is strongly bullish
+        if snapshot.macd_histogram is not None and snapshot.macd_histogram > 0 and snapshot.order_book_bias != "SELL":
+            return False, "macd_bullish"
         return True, "signal_and_order_book"
 
     return False, "no_entry_signal"
@@ -586,7 +608,12 @@ def inspect_market(settings: Settings, exchange: Any) -> MarketSnapshot:
     latest_close = float(analyzed.iloc[-1]["close"])
     long_ma = float(analyzed.iloc[-1]["ma_long"])
     ml_bias = None
-    from trader_app.strategy import compute_price_position
+    from trader_app.strategy import (
+        compute_price_position,
+        compute_latest_macd,
+        compute_confluence_score,
+        has_volume_confirmation,
+    )
 
     recent_low, recent_high, price_position = compute_price_position(frame)
     previous_close = float(frame.iloc[-2]["close"]) if len(frame) >= 2 else latest_close
@@ -615,6 +642,15 @@ def inspect_market(settings: Settings, exchange: Any) -> MarketSnapshot:
         long_ma_slope = float(analyzed["ma_long"].iloc[-1] - analyzed["ma_long"].iloc[-3])
 
     latest_bar_time = float(frame["time"].iloc[-1].timestamp())
+
+    # MACD histogram
+    _, _, macd_hist_val = compute_latest_macd(frame)
+
+    # Confluence score
+    confluence = compute_confluence_score(frame, signal)
+
+    # Volume confirmation
+    vol_confirmed = has_volume_confirmation(frame)
 
     if settings.use_xgboost:
         from trader_app.strategy import compute_ml_bias
@@ -653,6 +689,9 @@ def inspect_market(settings: Settings, exchange: Any) -> MarketSnapshot:
         spread=spread,
         long_ma_slope=long_ma_slope,
         latest_bar_time=latest_bar_time,
+        macd_histogram=macd_hist_val,
+        confluence_score=confluence,
+        volume_confirmed=vol_confirmed,
     )
 
 
@@ -816,6 +855,22 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
     current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
     if current_equity is not None:
         state.last_total_equity = current_equity
+        # Track historical peak equity for accurate drawdown calculation
+        if state.peak_equity is None or current_equity > state.peak_equity:
+            state.peak_equity = current_equity
+
+    # Drawdown protection — stop trading if peak-equity drawdown exceeds limit
+    if settings.max_drawdown > 0:
+        if current_equity is not None and state.peak_equity is not None and state.peak_equity > 0:
+            dd = (state.peak_equity - current_equity) / state.peak_equity
+            if dd >= settings.max_drawdown:
+                summary = format_decision_summary(snapshot, settings.use_xgboost)
+                position_tag = "HOLDING" if state.has_position else "FLAT"
+                return CycleOutcome(
+                    f"{position_tag} | {summary} decision=STOP reason=max_drawdown_exceeded drawdown={dd:.2%}",
+                    terminate=True,
+                    snapshot=snapshot,
+                )
 
     if state.has_position:
         should_exit, reason = should_exit_position(
@@ -886,7 +941,7 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
 
     if snapshot.signal in {"BUY", "SELL"}:
         summary = format_decision_summary(snapshot, settings.use_xgboost)
-        enter, reason = should_enter_position(snapshot, settings.allow_short, settings.use_xgboost)
+        enter, reason = should_enter_position(snapshot, settings.allow_short, settings.use_xgboost, settings)
         if not enter:
             current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
             reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
@@ -985,6 +1040,10 @@ def render_dashboard(settings: Settings, state: BotState, snapshot: MarketSnapsh
     signal_color = ANSI_GREEN if snapshot.signal == "BUY" else ANSI_RED
     order_book_color = ANSI_GREEN if snapshot.order_book_bias == "BUY" else ANSI_RED if snapshot.order_book_bias == "SELL" else ANSI_YELLOW
 
+    macd_text = f"{snapshot.macd_histogram:.4f}" if snapshot.macd_histogram is not None else "n/a"
+    confluence_text = str(snapshot.confluence_score) if snapshot.confluence_score is not None else "n/a"
+    vol_text = "YES" if snapshot.volume_confirmed else "NO" if snapshot.volume_confirmed is not None else "n/a"
+
     print(_color_text("╔" + "═" * 62 + "╗", ANSI_BOLD, ANSI_CYAN), flush=True)
     print(
         _color_text("║ TRADER DASHBOARD", ANSI_BOLD, ANSI_MAGENTA)
@@ -1019,6 +1078,12 @@ def render_dashboard(settings: Settings, state: BotState, snapshot: MarketSnapsh
     print(
         f"{_dashboard_label('Equity')}: {_dashboard_value(equity, ANSI_GREEN)} "
         f"{_dashboard_label('SL/TP')}: {_dashboard_value(f'{settings.stop_loss*100:.1f}%/{settings.take_profit*100:.1f}%', ANSI_WHITE)}",
+        flush=True,
+    )
+    print(
+        f"{_dashboard_label('MACD')}: {_dashboard_value(macd_text, ANSI_YELLOW)} "
+        f"{_dashboard_label('Confluence')}: {_dashboard_value(confluence_text, ANSI_CYAN)} "
+        f"{_dashboard_label('VolOK')}: {_dashboard_value(vol_text, ANSI_GREEN if snapshot.volume_confirmed else ANSI_RED)}",
         flush=True,
     )
     print(
@@ -1105,6 +1170,7 @@ def run_bot(settings: Settings) -> int:
                     entry_amount=state.entry_amount,
                     entry_cost=state.entry_cost,
                     last_total_equity=state.last_total_equity,
+                    peak_equity=state.peak_equity,
                 )
                 command_outcome = handle_user_command(settings, exchange, state, command)
                 if before_command != state:
@@ -1121,6 +1187,7 @@ def run_bot(settings: Settings) -> int:
                 entry_amount=state.entry_amount,
                 entry_cost=state.entry_cost,
                 last_total_equity=state.last_total_equity,
+                peak_equity=state.peak_equity,
             )
             outcome = run_cycle(settings=settings, exchange=exchange, state=state)
             if before != state:

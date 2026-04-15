@@ -230,6 +230,7 @@ def test_save_and_load_state_round_trip(tmp_path):
         "last_candle_time": None,
         "last_entry_signal": "BUY",
         "last_total_equity": 1200.0,
+        "peak_equity": None,
     }
 
 
@@ -1329,3 +1330,236 @@ def test_run_bot_returns_one_on_authentication_error(monkeypatch, capsys):
     assert exit_code == 1
     assert "environment=sandbox execution=live symbol=BTC/USDT api=https://api-testnet.bybit.com" in captured.out
     assert "Authentication failed for exchange=bybit in sandbox/testnet mode" in captured.out
+
+
+# —————————————————————————————————
+# New feature tests
+# —————————————————————————————————
+
+
+def test_compute_macd_returns_three_series():
+    from trader_app.strategy import compute_macd
+    series = pd.Series(list(range(1, 101)), dtype=float)
+    macd_line, signal_line, histogram = compute_macd(series)
+    assert len(macd_line) == 100
+    assert len(signal_line) == 100
+    assert len(histogram) == 100
+    # MACD histogram should equal macd_line - signal_line
+    diff = abs(float(histogram.iloc[-1]) - (float(macd_line.iloc[-1]) - float(signal_line.iloc[-1])))
+    assert diff < 1e-9
+
+
+def test_compute_macd_bullish_for_uptrend():
+    from trader_app.strategy import compute_macd
+    series = pd.Series(list(range(1, 101)), dtype=float)
+    _, _, histogram = compute_macd(series)
+    # Steady uptrend should produce positive histogram
+    assert float(histogram.iloc[-1]) > 0
+
+
+def test_compute_macd_bearish_for_downtrend():
+    from trader_app.strategy import compute_macd
+    series = pd.Series(list(range(100, 0, -1)), dtype=float)
+    _, _, histogram = compute_macd(series)
+    # Steady downtrend should produce negative histogram
+    assert float(histogram.iloc[-1]) < 0
+
+
+def test_compute_confluence_score_uptrend():
+    from trader_app.strategy import compute_confluence_score
+    frame = pd.DataFrame({
+        "close": list(range(1, 101)),
+        "high": [x + 1 for x in range(1, 101)],
+        "low": [max(1, x - 1) for x in range(1, 101)],
+        "volume": [100.0] * 100,
+    })
+    score = compute_confluence_score(frame, "BUY")
+    assert isinstance(score, int)
+    assert score >= 0
+
+
+def test_compute_confluence_score_downtrend():
+    from trader_app.strategy import compute_confluence_score
+    frame = pd.DataFrame({
+        "close": list(range(100, 0, -1)),
+        "high": [x + 1 for x in range(100, 0, -1)],
+        "low": [max(1, x - 1) for x in range(100, 0, -1)],
+        "volume": [100.0] * 100,
+    })
+    score = compute_confluence_score(frame, "SELL")
+    assert isinstance(score, int)
+    assert score >= 0
+
+
+def test_has_volume_confirmation_true_when_above_average():
+    from trader_app.strategy import has_volume_confirmation
+    frame = pd.DataFrame({
+        "close": list(range(1, 51)),
+        "volume": [50.0] * 49 + [100.0],
+    })
+    assert has_volume_confirmation(frame) is True
+
+
+def test_has_volume_confirmation_false_when_below_average():
+    from trader_app.strategy import has_volume_confirmation
+    frame = pd.DataFrame({
+        "close": list(range(1, 51)),
+        "volume": [100.0] * 49 + [10.0],
+    })
+    assert has_volume_confirmation(frame) is False
+
+
+def test_has_volume_confirmation_no_volume_column():
+    from trader_app.strategy import has_volume_confirmation
+    frame = pd.DataFrame({"close": list(range(1, 51))})
+    assert has_volume_confirmation(frame) is True
+
+
+def test_compute_latest_macd():
+    from trader_app.strategy import compute_latest_macd
+    frame = pd.DataFrame({"close": list(range(1, 101)), "high": list(range(1, 101)), "low": list(range(1, 101))})
+    m, s, h = compute_latest_macd(frame)
+    assert isinstance(m, float)
+    assert isinstance(s, float)
+    assert isinstance(h, float)
+
+
+def test_should_enter_blocks_low_volume():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10.0,
+        ask_volume=5.0,
+        order_book_bias="BUY",
+        latest_close=100.0,
+        best_bid=99.0,
+        best_ask=101.0,
+        long_ma=95.0,
+        long_ma_slope=1.0,
+        price_position=0.5,
+        momentum=1.0,
+        macd_histogram=0.5,
+        confluence_score=3,
+        volume_confirmed=False,
+    )
+    settings = Settings(volume_confirmation=True)
+    enter, reason = should_enter_position(snapshot, False, False, settings)
+    assert not enter
+    assert reason == "low_volume"
+
+
+def test_should_enter_blocks_low_confluence():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10.0,
+        ask_volume=5.0,
+        order_book_bias="BUY",
+        latest_close=100.0,
+        best_bid=99.0,
+        best_ask=101.0,
+        long_ma=95.0,
+        long_ma_slope=1.0,
+        price_position=0.5,
+        momentum=1.0,
+        macd_histogram=0.5,
+        confluence_score=1,
+        volume_confirmed=True,
+    )
+    settings = Settings(confluence_threshold=3)
+    enter, reason = should_enter_position(snapshot, False, False, settings)
+    assert not enter
+    assert "low_confluence" in reason
+
+
+def test_should_enter_passes_confluence_and_volume():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10.0,
+        ask_volume=5.0,
+        order_book_bias="BUY",
+        latest_close=100.0,
+        best_bid=99.0,
+        best_ask=101.0,
+        long_ma=95.0,
+        long_ma_slope=1.0,
+        price_position=0.5,
+        momentum=1.0,
+        macd_histogram=0.5,
+        confluence_score=3,
+        volume_confirmed=True,
+    )
+    settings = Settings(confluence_threshold=2, volume_confirmation=True)
+    enter, reason = should_enter_position(snapshot, False, False, settings)
+    assert enter
+    assert reason == "signal_and_order_book"
+
+
+def test_should_enter_blocks_macd_bearish_for_buy():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10.0,
+        ask_volume=5.0,
+        order_book_bias="NEUTRAL",
+        latest_close=100.0,
+        best_bid=99.0,
+        best_ask=101.0,
+        long_ma=95.0,
+        long_ma_slope=1.0,
+        price_position=0.5,
+        momentum=1.0,
+        macd_histogram=-2.0,
+        confluence_score=5,
+        volume_confirmed=True,
+    )
+    enter, reason = should_enter_position(snapshot, False, False)
+    assert not enter
+    assert reason == "macd_bearish"
+
+
+def test_macd_histogram_in_ml_features():
+    from trader_app.strategy import add_moving_averages, build_ml_features
+    frame = pd.DataFrame({
+        "close": list(range(1, 301)),
+        "high": [x + 1 for x in range(1, 301)],
+        "low": [max(1, x - 1) for x in range(1, 301)],
+        "volume": [100.0] * 300,
+    })
+    analyzed = add_moving_averages(frame, short_window=50, long_window=200)
+    features = build_ml_features(analyzed)
+    assert "macd_histogram" in features.columns
+
+
+def test_drawdown_protection_terminates_cycle(monkeypatch):
+    """When equity drop exceeds max_drawdown the cycle should terminate."""
+    settings = Settings(
+        max_drawdown=0.05,
+        poll_seconds=0,
+    )
+    state = BotState(
+        has_position=False,
+        last_total_equity=1000.0,
+        peak_equity=1000.0,
+    )
+    # Simulate a 6% drawdown
+    fake_snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10.0,
+        ask_volume=5.0,
+        order_book_bias="BUY",
+        latest_close=100.0,
+        best_bid=99.0,
+        best_ask=101.0,
+        long_ma=95.0,
+    )
+
+    import trader_app.bot as bot_module
+
+    monkeypatch.setattr(bot_module, "inspect_market", lambda s, e: fake_snapshot)
+    # Return equity at 940 (6% below peak of 1000)
+    monkeypatch.setattr(bot_module, "fetch_total_equity", lambda s, e, p=None: 940.0)
+
+    class FakeExchange:
+        pass
+
+    outcome = run_cycle(settings, FakeExchange(), state)
+    assert outcome.terminate is True
+    assert "max_drawdown_exceeded" in outcome.message
