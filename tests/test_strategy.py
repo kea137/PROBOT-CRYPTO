@@ -230,6 +230,7 @@ def test_save_and_load_state_round_trip(tmp_path):
         "last_candle_time": None,
         "last_entry_signal": "BUY",
         "last_total_equity": 1200.0,
+        "peak_equity": None,
     }
 
 
@@ -1536,6 +1537,7 @@ def test_drawdown_protection_terminates_cycle(monkeypatch):
     state = BotState(
         has_position=False,
         last_total_equity=1000.0,
+        peak_equity=1000.0,
     )
     # Simulate a 6% drawdown
     fake_snapshot = MarketSnapshot(
@@ -1552,7 +1554,7 @@ def test_drawdown_protection_terminates_cycle(monkeypatch):
     import trader_app.bot as bot_module
 
     monkeypatch.setattr(bot_module, "inspect_market", lambda s, e: fake_snapshot)
-    # Return equity at 940 (6% below 1000)
+    # Return equity at 940 (6% below peak of 1000)
     monkeypatch.setattr(bot_module, "fetch_total_equity", lambda s, e, p=None: 940.0)
 
     class FakeExchange:

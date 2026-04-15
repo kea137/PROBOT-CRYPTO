@@ -396,7 +396,7 @@ python3 trader.py \
 ```
 
 **Why this works:**
-- XGBoost model uses 17+ features including MACD histogram for prediction
+- XGBoost model uses 18 features including MACD histogram for prediction
 - ML bias adds an independent confirmation layer
 - Conservative 2.0/4.0 ATR stops with 1:2 risk-reward
 - Confluence threshold of 2 prevents conflicting signals

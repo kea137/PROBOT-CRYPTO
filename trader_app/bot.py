@@ -62,6 +62,7 @@ class BotState:
     entry_cost: float | None = None
     last_total_equity: float | None = None
     last_candle_time: float | None = None
+    peak_equity: float | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,7 @@ def load_state(state_file: str) -> BotState:
         entry_cost=data.get("entry_cost"),
         last_total_equity=data.get("last_total_equity"),
         last_candle_time=data.get("last_candle_time"),
+        peak_equity=data.get("peak_equity"),
     )
 
 
@@ -853,20 +855,22 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
     current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
     if current_equity is not None:
         state.last_total_equity = current_equity
+        # Track historical peak equity for accurate drawdown calculation
+        if state.peak_equity is None or current_equity > state.peak_equity:
+            state.peak_equity = current_equity
 
     # Drawdown protection — stop trading if peak-equity drawdown exceeds limit
-    if settings.max_drawdown > 0 and not state.has_position:
-        if current_equity is not None and prior_equity is not None:
-            peak = max(prior_equity, current_equity)
-            if peak > 0:
-                dd = (peak - current_equity) / peak
-                if dd >= settings.max_drawdown:
-                    summary = format_decision_summary(snapshot, settings.use_xgboost)
-                    return CycleOutcome(
-                        f"FLAT | {summary} decision=STOP reason=max_drawdown_exceeded drawdown={dd:.2%}",
-                        terminate=True,
-                        snapshot=snapshot,
-                    )
+    if settings.max_drawdown > 0:
+        if current_equity is not None and state.peak_equity is not None and state.peak_equity > 0:
+            dd = (state.peak_equity - current_equity) / state.peak_equity
+            if dd >= settings.max_drawdown:
+                summary = format_decision_summary(snapshot, settings.use_xgboost)
+                position_tag = "HOLDING" if state.has_position else "FLAT"
+                return CycleOutcome(
+                    f"{position_tag} | {summary} decision=STOP reason=max_drawdown_exceeded drawdown={dd:.2%}",
+                    terminate=True,
+                    snapshot=snapshot,
+                )
 
     if state.has_position:
         should_exit, reason = should_exit_position(
@@ -1166,6 +1170,7 @@ def run_bot(settings: Settings) -> int:
                     entry_amount=state.entry_amount,
                     entry_cost=state.entry_cost,
                     last_total_equity=state.last_total_equity,
+                    peak_equity=state.peak_equity,
                 )
                 command_outcome = handle_user_command(settings, exchange, state, command)
                 if before_command != state:
@@ -1182,6 +1187,7 @@ def run_bot(settings: Settings) -> int:
                 entry_amount=state.entry_amount,
                 entry_cost=state.entry_cost,
                 last_total_equity=state.last_total_equity,
+                peak_equity=state.peak_equity,
             )
             outcome = run_cycle(settings=settings, exchange=exchange, state=state)
             if before != state:
