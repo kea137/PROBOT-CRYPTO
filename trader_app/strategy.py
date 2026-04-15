@@ -29,6 +29,7 @@ FEATURE_COLUMNS = [
     "ema_cross",
     "adx",
     "vwap_distance",
+    "macd_histogram",
 ]
 
 # —————————————————————————
@@ -116,6 +117,104 @@ def compute_adx(frame: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def compute_ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, min_periods=span).mean()
+
+
+def compute_macd(
+    series: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal_period: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Returns (macd_line, signal_line, histogram).
+
+    The histogram is positive when MACD is above its signal line (bullish
+    momentum) and negative when below (bearish momentum).
+    """
+    ema_fast = series.ewm(span=fast, min_periods=fast).mean()
+    ema_slow = series.ewm(span=slow, min_periods=slow).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal_period, min_periods=signal_period).mean()
+    histogram = macd_line - signal_line
+    return macd_line.fillna(0.0), signal_line.fillna(0.0), histogram.fillna(0.0)
+
+
+def compute_confluence_score(
+    frame: pd.DataFrame,
+    signal: str,
+) -> int:
+    """Count how many independent indicators agree with *signal*.
+
+    Each indicator that confirms the proposed direction adds +1.
+    Returns a non-negative integer; higher = stronger confluence.
+
+    Checked indicators:
+    1. RSI oversold/overbought alignment
+    2. MACD histogram direction
+    3. ADX trending (>25) plus directional alignment
+    4. Bollinger Band position alignment
+    5. Volume above 20-period average
+    """
+    score = 0
+    close = frame["close"]
+    latest_close = float(close.iloc[-1])
+
+    # 1 — RSI
+    rsi_val = float(compute_rsi(close, period=14).iloc[-1])
+    if signal == "BUY" and rsi_val < 65:
+        score += 1
+    elif signal == "SELL" and rsi_val > 35:
+        score += 1
+
+    # 2 — MACD histogram
+    _, _, histogram = compute_macd(close)
+    hist_val = float(histogram.iloc[-1])
+    if signal == "BUY" and hist_val > 0:
+        score += 1
+    elif signal == "SELL" and hist_val < 0:
+        score += 1
+
+    # 3 — ADX trend strength + direction
+    adx_val = float(compute_adx(frame, period=14).iloc[-1])
+    if adx_val > 25:
+        high = frame["high"] if "high" in frame.columns else close
+        low = frame["low"] if "low" in frame.columns else close
+        up_move = float(high.diff().iloc[-1])
+        down_move = float(-low.diff().iloc[-1])
+        if signal == "BUY" and up_move > down_move:
+            score += 1
+        elif signal == "SELL" and down_move > up_move:
+            score += 1
+
+    # 4 — Bollinger Band position
+    bb_upper, _, bb_lower = compute_bollinger_bands(close, period=20)
+    bb_range = float(bb_upper.iloc[-1]) - float(bb_lower.iloc[-1])
+    if bb_range > 0:
+        bb_pos = (latest_close - float(bb_lower.iloc[-1])) / bb_range
+        if signal == "BUY" and bb_pos < 0.7:
+            score += 1
+        elif signal == "SELL" and bb_pos > 0.3:
+            score += 1
+
+    # 5 — Volume confirmation
+    if "volume" in frame.columns:
+        vol = frame["volume"]
+        avg_vol = float(vol.rolling(20, min_periods=1).mean().iloc[-1])
+        if avg_vol > 0 and float(vol.iloc[-1]) >= avg_vol:
+            score += 1
+
+    return score
+
+
+def has_volume_confirmation(frame: pd.DataFrame, threshold: float = 1.0) -> bool:
+    """Return True if current volume is at least *threshold* × 20-period average."""
+    if "volume" not in frame.columns or len(frame) < 1:
+        return True  # no volume data — don't block
+    vol = frame["volume"]
+    avg_vol = float(vol.rolling(20, min_periods=1).mean().iloc[-1])
+    if avg_vol <= 0:
+        return True
+    return float(vol.iloc[-1]) >= avg_vol * threshold
+
 
 # —————————————————————————
 # ATR-based risk helpers
@@ -239,6 +338,10 @@ def build_ml_features(frame: pd.DataFrame) -> pd.DataFrame:
 
     vwap = compute_vwap(features)
     features["vwap_distance"] = (features["close"] - vwap) / vwap.replace(0, 1.0)
+
+    _, _, macd_hist = compute_macd(features["close"])
+    features["macd_histogram"] = macd_hist
+
     return features
 
 # —————————————————————————
@@ -413,3 +516,13 @@ def compute_latest_atr(frame: pd.DataFrame, period: int = 14) -> float:
     """Returns the ATR for the most recent bar."""
     atr_series = compute_atr(frame, period=period)
     return float(atr_series.iloc[-1]) if len(atr_series) > 0 else 0.0
+
+
+def compute_latest_macd(frame: pd.DataFrame) -> tuple[float, float, float]:
+    """Returns (macd_line, signal_line, histogram) for the most recent bar."""
+    macd_line, signal_line, histogram = compute_macd(frame["close"])
+    return (
+        float(macd_line.iloc[-1]),
+        float(signal_line.iloc[-1]),
+        float(histogram.iloc[-1]),
+    )

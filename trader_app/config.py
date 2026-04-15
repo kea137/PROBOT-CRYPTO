@@ -36,5 +36,11 @@ class Settings:
     min_adx: float = 0.0
     rsi_filter: bool = False
     loss_cooldown: int = 0
+    # — confluence & volume —
+    confluence_threshold: int = 0
+    volume_confirmation: bool = False
+    # — drawdown protection —
+    max_daily_loss: float = 0.0
+    max_drawdown: float = 0.0
 
 DEFAULT_SETTINGS = Settings()
