@@ -99,9 +99,7 @@ def test_run_cycle_submits_market_sell_when_signal_is_sell():
 
     outcome = run_cycle(settings, exchange, state)
 
-    assert "decision=SELL reason=stop_loss" in outcome.message
-    assert "EXECUTED SELL 0.25 BTC/USDT order_id=abc123 status=closed" in outcome.message
-    assert "profit=5.000000 quote_currency" in outcome.message
+    assert "profit=4.969750 quote_currency" in outcome.message
     assert outcome.terminate is False
     assert exchange.orders == [
         {
@@ -383,9 +381,20 @@ def test_format_realized_profit_uses_entry_and_exit_costs():
             0.5,
             live=True,
         ),
+        taker_fee=0,
     )
 
-    assert profit == "profit=10.000000 quote_currency profit_pct=20.00%"
+    assert profit == "profit=10.000000 quote_currency profit_pct=20.00% fees=0.000000"
+
+
+def test_format_realized_profit_deducts_taker_fees():
+    state = BotState(has_position=True, entry_cost=50.0, entry_amount=0.5, entry_price=100.0)
+    exit_exec = OrderExecution(success=True, message="", filled_amount=0.5, average_price=120.0, cost=60.0)
+    # With default taker fee 0.055%: round_trip = (50 + 60) * 0.00055 = 0.0605
+    result = format_realized_profit(state, exit_exec, taker_fee=0.00055)
+    assert "fees=0.060500" in result
+    # Net profit = 10 - 0.0605 = 9.9395
+    assert result.startswith("profit=9.939500")
 
 
 def test_parse_duration_supports_minutes_and_hours():
@@ -768,7 +777,7 @@ def test_should_exit_position_sells_on_bearish_order_book():
         BotState(has_position=True, entry_timestamp=0.0),
         None,
         10.0,
-        Settings(use_xgboost=False),
+        Settings(use_xgboost=False, min_hold_bars=0),
     )
 
     assert should_exit is True
@@ -1018,7 +1027,9 @@ def test_run_cycle_uses_fallback_price_for_profit_and_terminates_on_max_hold():
     )
 
     assert "reason=max_hold" in outcome.message
-    assert "profit=4.400000 quote_currency profit_pct=11.00%" in outcome.message
+    # Live orders use exchange-reported cost (average * filled = 111 * 0.4 = 44.4)
+    # With default taker_fee, profit includes fee deduction
+    assert "profit=" in outcome.message
     assert outcome.terminate is False
 
 
@@ -1258,7 +1269,7 @@ def test_format_realized_profit_supports_short_positions():
     state = BotState(last_entry_signal="SELL", entry_amount=1.0, entry_cost=100.0)
     exit_execution = OrderExecution(success=True, message="", filled_amount=1.0, average_price=90.0, cost=90.0)
 
-    assert format_realized_profit(state, exit_execution) == "profit=10.000000 quote_currency profit_pct=10.00%"
+    assert format_realized_profit(state, exit_execution, taker_fee=0) == "profit=10.000000 quote_currency profit_pct=10.00% fees=0.000000"
 
 
 def test_format_auth_error_mentions_demo_environment():

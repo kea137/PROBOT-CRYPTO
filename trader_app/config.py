@@ -39,6 +39,12 @@ class Settings:
     # — confluence & volume —
     confluence_threshold: int = 0
     volume_confirmation: bool = False  # applies -1 confluence penalty when volume is below 20-period average
+    # — fee / slippage model —
+    taker_fee: float = 0.00055       # 0.055% — Bybit unified taker fee
+    maker_fee: float = 0.0002        # 0.02%  — Bybit unified maker fee
+    slippage_pct: float = 0.0001     # 0.01%  — estimated market impact
+    # — churn protection —
+    min_hold_bars: int = 10          # min bars before soft exits (signal_flip, momentum, pressure)
     # — drawdown protection —
     max_daily_loss: float = 0.0
     max_drawdown: float = 0.0

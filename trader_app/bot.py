@@ -374,6 +374,8 @@ def execute_trade(
     amount: float,
     live: bool,
     fallback_price: float | None = None,
+    taker_fee: float = 0.00055,
+    slippage_pct: float = 0.0001,
 ) -> OrderExecution:
     side = signal.lower()
 
@@ -383,12 +385,21 @@ def execute_trade(
         raise ValueError("order_amount must be a positive number.")
 
     if not live:
-        cost = fallback_price * amount if fallback_price is not None else None
+        if fallback_price is not None:
+            # Apply slippage: buys fill higher, sells fill lower
+            if side == "buy":
+                sim_price = fallback_price * (1 + slippage_pct)
+            else:
+                sim_price = fallback_price * (1 - slippage_pct)
+            cost = sim_price * amount * (1 + taker_fee)
+        else:
+            sim_price = None
+            cost = None
         return OrderExecution(
             success=True,
             message=f"DRY_RUN {signal} {amount} {symbol}",
             filled_amount=amount,
-            average_price=fallback_price,
+            average_price=sim_price,
             cost=cost,
         )
 
@@ -429,7 +440,11 @@ def execute_signal(exchange: Any, symbol: str, signal: str, amount: float, live:
     return execute_trade(exchange, symbol, signal, amount, live).message
 
 
-def format_realized_profit(state: BotState, exit_execution: OrderExecution) -> str:
+def format_realized_profit(
+    state: BotState,
+    exit_execution: OrderExecution,
+    taker_fee: float = 0.00055,
+) -> str:
     entry_cost = state.entry_cost
     exit_cost = exit_execution.cost
     if entry_cost is None and state.entry_price is not None and state.entry_amount is not None:
@@ -439,12 +454,15 @@ def format_realized_profit(state: BotState, exit_execution: OrderExecution) -> s
     if entry_cost is None or exit_cost is None:
         return "profit=unavailable"
 
+    # Deduct round-trip taker fees from the PnL
+    round_trip_fees = (entry_cost + exit_cost) * taker_fee
+
     if state.last_entry_signal == "SELL":
-        pnl = entry_cost - exit_cost
+        pnl = entry_cost - exit_cost - round_trip_fees
     else:
-        pnl = exit_cost - entry_cost
+        pnl = exit_cost - entry_cost - round_trip_fees
     pnl_pct = 0.0 if entry_cost == 0 else (pnl / entry_cost) * 100
-    return f"profit={pnl:.6f} quote_currency profit_pct={pnl_pct:.2f}%"
+    return f"profit={pnl:.6f} quote_currency profit_pct={pnl_pct:.2f}% fees={round_trip_fees:.6f}"
 
 
 def _format_equity_delta_text(prior_equity: float | None, current_equity: float | None) -> str:
@@ -829,6 +847,16 @@ def should_exit_position(
                 return True, "take_profit"
     ml_bias = _effective_ml_bias(snapshot)
     price_position = getattr(snapshot, "price_position", None)
+
+    # Determine how many bars we've held this position.
+    _tf_seconds = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600,
+                   "4h": 14400, "1d": 86400}
+    _bar_secs = _tf_seconds.get(settings.timeframe, 3600)
+    if state.entry_timestamp is not None:
+        bars_held = int((now - state.entry_timestamp) / _bar_secs)
+    else:
+        bars_held = settings.min_hold_bars  # allow soft exits if unknown
+
     if settings.use_xgboost and ml_bias is not None:
         if entry_signal == "BUY" and ml_bias == "SELL":
             return True, "ml_signal"
@@ -837,27 +865,33 @@ def should_exit_position(
     if entry_signal == "BUY":
         if settings.use_xgboost and price_position is not None and price_position >= 0.88:
             return True, "price_peak"
-        if snapshot.signal == "SELL":
-            return True, "signal_flip"
-        if snapshot.order_book_bias == "SELL":
-            return True, "sell_pressure"
-        if snapshot.momentum is not None and snapshot.momentum < 0 and snapshot.order_book_bias == "SELL":
-            return True, "negative_momentum"
+        if bars_held >= settings.min_hold_bars:
+            if snapshot.signal == "SELL":
+                return True, "signal_flip"
+            if snapshot.order_book_bias == "SELL":
+                return True, "sell_pressure"
+            if snapshot.momentum is not None and snapshot.momentum < 0 and snapshot.order_book_bias == "SELL":
+                return True, "negative_momentum"
         return False, "hold"
     if entry_signal == "SELL":
         if settings.use_xgboost and price_position is not None and price_position <= 0.12:
             return True, "price_trough"
-        if snapshot.signal == "BUY":
-            return True, "signal_flip"
-        if snapshot.order_book_bias == "BUY":
-            return True, "buy_pressure"
-        if snapshot.momentum is not None and snapshot.momentum > 0:
-            return True, "positive_momentum"
+        if bars_held >= settings.min_hold_bars:
+            if snapshot.signal == "BUY":
+                return True, "signal_flip"
+            if snapshot.order_book_bias == "BUY":
+                return True, "buy_pressure"
+            if snapshot.momentum is not None and snapshot.momentum > 0:
+                return True, "positive_momentum"
         return False, "hold"
     return False, "hold"
 
 
-def _compute_realized_profit_amount(state: BotState, exit_execution: OrderExecution) -> float | None:
+def _compute_realized_profit_amount(
+    state: BotState,
+    exit_execution: OrderExecution,
+    taker_fee: float = 0.00055,
+) -> float | None:
     entry_cost = state.entry_cost
     if entry_cost is None and state.entry_price is not None and state.entry_amount is not None:
         entry_cost = state.entry_price * state.entry_amount
@@ -866,7 +900,9 @@ def _compute_realized_profit_amount(state: BotState, exit_execution: OrderExecut
         exit_cost = exit_execution.average_price * exit_execution.filled_amount
     if entry_cost is None or exit_cost is None:
         return None
-    return entry_cost - exit_cost if state.last_entry_signal == "SELL" else exit_cost - entry_cost
+    round_trip_fees = (entry_cost + exit_cost) * taker_fee
+    raw = entry_cost - exit_cost if state.last_entry_signal == "SELL" else exit_cost - entry_cost
+    return raw - round_trip_fees
 
 
 def liquidate_position(settings: Settings, exchange: Any, state: BotState, reason: str) -> CycleOutcome:
@@ -889,8 +925,10 @@ def liquidate_position(settings: Settings, exchange: Any, state: BotState, reaso
         amount=close_amount,
         live=settings.execute_orders,
         fallback_price=(snapshot.best_bid if close_signal == "SELL" else snapshot.best_ask) or snapshot.latest_close,
+        taker_fee=settings.taker_fee,
+        slippage_pct=settings.slippage_pct,
     )
-    profit_message = format_realized_profit(state, exit_execution)
+    profit_message = format_realized_profit(state, exit_execution, taker_fee=settings.taker_fee)
     exit_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
     equity_delta_text = _format_equity_delta_text(state.last_total_equity, exit_equity)
     if exit_execution.success and exit_equity is not None:
@@ -898,7 +936,7 @@ def liquidate_position(settings: Settings, exchange: Any, state: BotState, reaso
     if exit_execution.success and settings.use_xgboost:
         from trader_app.strategy import reward_ml_model
 
-        profit_amount = _compute_realized_profit_amount(state, exit_execution)
+        profit_amount = _compute_realized_profit_amount(state, exit_execution, taker_fee=settings.taker_fee)
         ml_bias = _effective_ml_bias(snapshot)
         if profit_amount is not None and profit_amount > 0 and ml_bias == state.last_entry_signal:
             reward_ml_model(ml_bias, profit_amount)
@@ -999,8 +1037,10 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                 amount=close_amount,
                 live=settings.execute_orders,
                 fallback_price=(snapshot.best_bid if exit_signal == "SELL" else snapshot.best_ask) or snapshot.latest_close,
+                taker_fee=settings.taker_fee,
+                slippage_pct=settings.slippage_pct,
             )
-            profit_message = format_realized_profit(state, exit_execution)
+            profit_message = format_realized_profit(state, exit_execution, taker_fee=settings.taker_fee)
             exit_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
             equity_delta_text = _format_equity_delta_text(prior_equity, exit_equity)
             if exit_execution.success and exit_equity is not None:
@@ -1008,7 +1048,7 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
             if exit_execution.success and settings.use_xgboost:
                 from trader_app.strategy import reward_ml_model
 
-                profit_amount = _compute_realized_profit_amount(state, exit_execution)
+                profit_amount = _compute_realized_profit_amount(state, exit_execution, taker_fee=settings.taker_fee)
                 if profit_amount is not None and profit_amount > 0:
                     ml_bias = _effective_ml_bias(snapshot)
                     if ml_bias == state.last_entry_signal:
@@ -1065,6 +1105,8 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
             amount=settings.order_amount,
             live=settings.execute_orders,
             fallback_price=(snapshot.best_ask if snapshot.signal == "BUY" else snapshot.best_bid) or snapshot.latest_close,
+            taker_fee=settings.taker_fee,
+            slippage_pct=settings.slippage_pct,
         )
         if entry_execution.success:
             update_state(
