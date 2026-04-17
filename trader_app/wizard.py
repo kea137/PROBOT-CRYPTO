@@ -312,15 +312,27 @@ def _step1_exchange() -> tuple[str, bool, bool]:
         exchange = _ask("Custom CCXT exchange id", default="bybit")
 
     print()
-    env = _ask(
-        "Environment",
-        options=[
+
+    # Only Bybit supports demo mode; other exchanges use sandbox or mainnet.
+    _demo_supported = exchange == "bybit"
+    if not _demo_supported:
+        print(_c(f"  ℹ  Demo mode is only available on Bybit.", _YLW))
+        print(_c(f"     For {exchange}, use Sandbox (testnet) or Mainnet.", _DIM, _WHT))
+        print()
+        env_options = [
+            ("sandbox",  "Sandbox / testnet     (no real funds, recommended for testing)"),
+            ("mainnet",  "Mainnet — real funds, real risk"),
+        ]
+        env_default = "sandbox"
+    else:
+        env_options = [
             ("demo",     "Demo / paper trading  (no real funds, recommended for testing)"),
             ("sandbox",  "Sandbox / testnet"),
             ("mainnet",  "Mainnet — real funds, real risk"),
-        ],
-        default="demo",
-    )
+        ]
+        env_default = "demo"
+
+    env = _ask("Environment", options=env_options, default=env_default)
     return exchange, env == "demo", env == "sandbox"
 
 
